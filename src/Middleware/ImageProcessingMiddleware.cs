@@ -35,7 +35,7 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
 
         await _next(context);
 
-        if (!IsSupportedContentType(contentType))
+        if (!IsSupportedContentType(contentType) && !IsPathToBeProcessed(context.Request.Path, _options))
         {
             await CopyStreamAndRestore(responseBodyStream, originalResponseBodyStream, context);
             return;
@@ -46,6 +46,7 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             int? width = null;
             int? height = null;
             int? maxSideSize = null;
+            string? mode = null;
             var format = contentType;
 
             if (context.Request.Query.ContainsKey("width") && int.TryParse(context.Request.Query["width"], out int parsedWidth))
@@ -53,6 +54,10 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
                 width = parsedWidth;
             }
 
+            if (context.Request.Query.ContainsKey("mode"))
+            {
+                mode = context.Request.Query["mode"];
+            }
             if (context.Request.Query.ContainsKey("height") && int.TryParse(context.Request.Query["height"], out int parsedHeight))
             {
                 height = parsedHeight;
@@ -92,7 +97,7 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
                     return;
                 }
 
-                var processedImageBytes = await ProcessImageAsync(originalImageBytes, width ?? 0, height ?? 0, maxSideSize ?? 0, format, contentType, context.Request.Path);
+                var processedImageBytes = await ProcessImageAsync(originalImageBytes, width ?? 0, height ?? 0, maxSideSize ?? 0, format, contentType, context.Request.Path, mode);
 
                 var filename = $"{Path.GetFileNameWithoutExtension(context.Request.Path)}.{GetFileExtensionByContentType(format)}";
 
@@ -114,9 +119,9 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         await CopyStreamAndRestore(responseBodyStream, originalResponseBodyStream, context);
     }
 
-    private async Task<byte[]> ProcessImageAsync(byte[] imageBytes, int width, int height, int maxSideSize, string format, string contentType, string path)
+    private async Task<byte[]> ProcessImageAsync(byte[] imageBytes, int width, int height, int maxSideSize, string format, string contentType, string path, string? resizeMode)
     {
-        if (imageBytes.Length == 0 || !IsSupportedContentType(contentType))
+        if (imageBytes.Length == 0 || (!IsSupportedContentType(contentType) && !IsPathToBeProcessed(path, _options)))
         {
             return imageBytes;
         }
@@ -136,17 +141,26 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
                 return imageBytes;
             }
 
-            var resizedBitmap = originalBitmap;
+            SKBitmap? resizedBitmap = null;
+            var newDims = ImageHelper.EnsureImageDimensions(width, height, maxSideSize, originalBitmap.Width, originalBitmap.Height);
 
-            if (width > 0 || height > 0 || maxSideSize > 0)
+            if (resizeMode == "cover")
             {
-                var newDims = ImageHelper.EnsureImageDimensions(width, height, maxSideSize, originalBitmap.Width, originalBitmap.Height);
-                resizedBitmap = originalBitmap.Resize(new SKImageInfo(newDims[0], newDims[1]), SKFilterQuality.High);
-                if (resizedBitmap == null)
-                {
-                    _eventLogService.LogWarning(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), "Failed to resize image.");
-                    return imageBytes;
-                }
+                resizedBitmap = ResizeWithCover(originalBitmap, width, height);
+            }
+            else if (resizeMode == "crop")
+            {
+                resizedBitmap = ResizeWithCrop(originalBitmap, width, height);
+            }
+            else
+            {
+                resizedBitmap = originalBitmap.Resize(new SKImageInfo(newDims[0], newDims[1]), SKSamplingOptions.Default);
+            }
+
+            if (resizedBitmap == null)
+            {
+                _eventLogService.LogWarning(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), "Failed to resize image.");
+                return imageBytes;
             }
 
             using var outputStream = new MemoryStream();
@@ -160,6 +174,132 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             return imageBytes;
         }
     }
+    private SKBitmap ResizeWithCover(SKBitmap original, int targetWidth, int targetHeight)
+    {
+        // Calculate missing dimension if needed.
+        if (targetWidth <= 0 && targetHeight > 0)
+        {
+            targetWidth = (int)Math.Round((double)original.Width * targetHeight / original.Height);
+        }
+        else if (targetHeight <= 0 && targetWidth > 0)
+        {
+            targetHeight = (int)Math.Round((double)original.Height * targetWidth / original.Width);
+        }
+        else if (targetWidth <= 0 && targetHeight <= 0)
+        {
+            // No dimensions provided; return original image.
+            return original;
+        }
+
+        float originalRatio = (float)original.Width / original.Height;
+        float targetRatio = (float)targetWidth / targetHeight;
+        int cropWidth, cropHeight;
+
+        // When the original is smaller than requested, avoid upscaling.
+        if (original.Width < targetWidth || original.Height < targetHeight)
+        {
+            if (originalRatio > targetRatio)
+            {
+                // Wider relative to target: use full height.
+                cropHeight = original.Height;
+                cropWidth = (int)(cropHeight * targetRatio);
+            }
+            else
+            {
+                // Taller relative to target: use full width.
+                cropWidth = original.Width;
+                cropHeight = (int)(cropWidth / targetRatio);
+            }
+            cropWidth = Math.Min(cropWidth, original.Width);
+            cropHeight = Math.Min(cropHeight, original.Height);
+        }
+        else
+        {
+            // For larger images, perform a cover crop.
+            if (originalRatio > targetRatio)
+            {
+                cropWidth = (int)(original.Height * targetRatio);
+                cropHeight = original.Height;
+            }
+            else
+            {
+                cropHeight = (int)(original.Width / targetRatio);
+                cropWidth = original.Width;
+            }
+        }
+
+        // Center cropping.
+        int cropX = (original.Width - cropWidth) / 2;
+        int cropY = (original.Height - cropHeight) / 2;
+        SKBitmap croppedBitmap = new SKBitmap(cropWidth, cropHeight);
+        using (var canvas = new SKCanvas(croppedBitmap))
+        {
+            canvas.DrawBitmap(
+                original,
+                new SKRect(cropX, cropY, cropX + cropWidth, cropY + cropHeight),
+                new SKRect(0, 0, cropWidth, cropHeight));
+        }
+
+        // If original is smaller than target, return cropped image without upscaling.
+        if (targetWidth > original.Width || targetHeight > original.Height)
+        {
+            return croppedBitmap;
+        }
+
+        SKBitmap resizedBitmap = croppedBitmap.Resize(new SKImageInfo(targetWidth, targetHeight), SKSamplingOptions.Default);
+        if (resizedBitmap != null)
+        {
+            croppedBitmap.Dispose();
+            return resizedBitmap;
+        }
+        else
+        {
+            return croppedBitmap;
+        }
+    }
+
+    private SKBitmap ResizeWithCrop(SKBitmap original, int targetWidth, int targetHeight)
+    {
+        // Calculate missing dimension if needed.
+        if (targetWidth <= 0 && targetHeight > 0)
+        {
+            targetWidth = (int)Math.Round((double)original.Width * targetHeight / original.Height);
+        }
+        else if (targetHeight <= 0 && targetWidth > 0)
+        {
+            targetHeight = (int)Math.Round((double)original.Height * targetWidth / original.Width);
+        }
+        else if (targetWidth <= 0 && targetHeight <= 0)
+        {
+            // No dimensions provided; return original image.
+            return original;
+        }
+
+        // Scale so that the image covers the target area.
+        float scale = Math.Max((float)targetWidth / original.Width, (float)targetHeight / original.Height);
+        int newWidth = (int)(original.Width * scale);
+        int newHeight = (int)(original.Height * scale);
+
+        using var resized = original.Resize(new SKImageInfo(newWidth, newHeight), SKSamplingOptions.Default);
+        if (resized == null)
+        {
+            return original; // Fallback if resizing fails.
+        }
+
+        int cropX = (newWidth - targetWidth) / 2;
+        int cropY = (newHeight - targetHeight) / 2;
+
+        var croppedImage = new SKBitmap(targetWidth, targetHeight);
+        using (var canvas = new SKCanvas(croppedImage))
+        {
+            var sourceRect = new SKRect(cropX, cropY, cropX + targetWidth, cropY + targetHeight);
+            var destRect = new SKRect(0, 0, targetWidth, targetHeight);
+            canvas.DrawBitmap(resized, sourceRect, destRect);
+        }
+
+        return croppedImage;
+    }
+
 
     private string GetContentTypeFromPath(PathString path)
     {
