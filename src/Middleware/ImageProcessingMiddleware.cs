@@ -152,6 +152,10 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             {
                 resizedBitmap = ResizeWithCrop(originalBitmap, width, height);
             }
+            else if (resizeMode == "contain")
+            {
+                resizedBitmap = ResizeWithContains(originalBitmap, width, height);
+            }
             else
             {
                 resizedBitmap = originalBitmap.Resize(new SKImageInfo(newDims[0], newDims[1]), SKSamplingOptions.Default);
@@ -299,7 +303,31 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
 
         return croppedImage;
     }
+    private SKBitmap ResizeWithContains(SKBitmap original, int targetWidth, int targetHeight)
+    {
+        // Calculate missing dimension if needed.
+        if (targetWidth <= 0 && targetHeight > 0)
+        {
+            targetWidth = (int)Math.Round((double)original.Width * targetHeight / original.Height);
+        }
+        else if (targetHeight <= 0 && targetWidth > 0)
+        {
+            targetHeight = (int)Math.Round((double)original.Height * targetWidth / original.Width);
+        }
+        else if (targetWidth <= 0 && targetHeight <= 0)
+        {
+            // No dimensions provided; return original image.
+            return original;
+        }
 
+        // Calculate scale to fit within target dimensions while preserving the aspect ratio.
+        float scale = Math.Min((float)targetWidth / original.Width, (float)targetHeight / original.Height);
+        int newWidth = (int)(original.Width * scale);
+        int newHeight = (int)(original.Height * scale);
+
+        SKBitmap resizedBitmap = original.Resize(new SKImageInfo(newWidth, newHeight), SKSamplingOptions.Default);
+        return resizedBitmap ?? original;
+    }
 
     private string GetContentTypeFromPath(PathString path)
     {
