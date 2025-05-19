@@ -137,7 +137,7 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             using var originalBitmap = SKBitmap.Decode(inputStream);
             if (originalBitmap == null)
             {
-                _eventLogService.LogWarning(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), "Failed to decode image.");
+                //_eventLogService.LogWarning(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), "Failed to decode image.");
                 return imageBytes;
             }
 
@@ -163,7 +163,7 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
 
             if (resizedBitmap == null)
             {
-                _eventLogService.LogWarning(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), "Failed to resize image.");
+                // _eventLogService.LogWarning(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), "Failed to resize image.");
                 return imageBytes;
             }
 
