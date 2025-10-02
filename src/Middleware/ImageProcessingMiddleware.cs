@@ -158,7 +158,7 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             }
             else
             {
-                resizedBitmap = originalBitmap.Resize(new SKImageInfo(newDims[0], newDims[1]), SKSamplingOptions.Default);
+                resizedBitmap = originalBitmap.Resize(new SKImageInfo(newDims[0], newDims[1]), SKFilterQuality.High);
             }
 
             if (resizedBitmap == null)
@@ -169,7 +169,21 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
 
             using var outputStream = new MemoryStream();
             var imageFormat = GetImageFormat(format);
-            await Task.Run(() => resizedBitmap.Encode(imageFormat, 80).SaveTo(outputStream));
+
+            // Choose a higher encoder quality for lossy formats to reduce pixelation.
+            var quality = imageFormat switch
+            {
+                SKEncodedImageFormat.Jpeg => _options.EncoderQuality,
+                SKEncodedImageFormat.Webp => _options.EncoderQuality,
+                SKEncodedImageFormat.Png => 100, // quality parameter is not used the same way for PNG
+                _ => _options.EncoderQuality
+            };
+
+            using (var encoded = resizedBitmap.Encode(imageFormat, quality))
+            {
+                encoded.SaveTo(outputStream);
+            }
+
             return outputStream.ToArray();
         }
         catch (Exception ex)
@@ -237,11 +251,13 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         int cropY = (original.Height - cropHeight) / 2;
         SKBitmap croppedBitmap = new SKBitmap(cropWidth, cropHeight);
         using (var canvas = new SKCanvas(croppedBitmap))
+        using (var paint = new SKPaint { IsAntialias = true })
         {
             canvas.DrawBitmap(
                 original,
                 new SKRect(cropX, cropY, cropX + cropWidth, cropY + cropHeight),
-                new SKRect(0, 0, cropWidth, cropHeight));
+                new SKRect(0, 0, cropWidth, cropHeight),
+                paint);
         }
 
         // If original is smaller than target, return cropped image without upscaling.
@@ -250,7 +266,8 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             return croppedBitmap;
         }
 
-        SKBitmap resizedBitmap = croppedBitmap.Resize(new SKImageInfo(targetWidth, targetHeight), SKSamplingOptions.Default);
+        // Use SKSamplingOptions.High instead of SKFilterQuality.High
+        SKBitmap resizedBitmap = croppedBitmap.Resize(new SKImageInfo(targetWidth, targetHeight), new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None));
         if (resizedBitmap != null)
         {
             croppedBitmap.Dispose();
@@ -284,7 +301,8 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         int newWidth = (int)(original.Width * scale);
         int newHeight = (int)(original.Height * scale);
 
-        using var resized = original.Resize(new SKImageInfo(newWidth, newHeight), SKSamplingOptions.Default);
+        // Use SKSamplingOptions.High instead of SKFilterQuality.High
+        using var resized = original.Resize(new SKImageInfo(newWidth, newHeight), new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None));
         if (resized == null)
         {
             return original; // Fallback if resizing fails.
@@ -295,14 +313,16 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
 
         var croppedImage = new SKBitmap(targetWidth, targetHeight);
         using (var canvas = new SKCanvas(croppedImage))
+        using (var paint = new SKPaint { IsAntialias = true })
         {
             var sourceRect = new SKRect(cropX, cropY, cropX + targetWidth, cropY + targetHeight);
             var destRect = new SKRect(0, 0, targetWidth, targetHeight);
-            canvas.DrawBitmap(resized, sourceRect, destRect);
+            canvas.DrawBitmap(resized, sourceRect, destRect, paint);
         }
 
         return croppedImage;
     }
+
     private SKBitmap ResizeWithContains(SKBitmap original, int targetWidth, int targetHeight)
     {
         // Calculate missing dimension if needed.
@@ -322,10 +342,18 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
 
         // Calculate scale to fit within target dimensions while preserving the aspect ratio.
         float scale = Math.Min((float)targetWidth / original.Width, (float)targetHeight / original.Height);
+
+        // Do not upscale in contain mode.
+        if (scale >= 1f)
+        {
+            return original;
+        }
+
         int newWidth = (int)(original.Width * scale);
         int newHeight = (int)(original.Height * scale);
 
-        SKBitmap resizedBitmap = original.Resize(new SKImageInfo(newWidth, newHeight), SKSamplingOptions.Default);
+        // Use SKSamplingOptions.High instead of SKFilterQuality.High
+        SKBitmap resizedBitmap = original.Resize(new SKImageInfo(newWidth, newHeight), new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None));
         return resizedBitmap ?? original;
     }
 
@@ -404,6 +432,9 @@ public class ImageProcessingOptions
 {
     public bool? ProcessMediaLibrary { get; set; } = true;
     public bool? ProcessContentItemAssets { get; set; } = true;
+
+    // Encoder quality for lossy formats (JPEG/WEBP). Higher values reduce artifacts.
+    public int EncoderQuality { get; set; } = 90;
 }
 
 public static class ImageProcessingMiddlewareExtensions
