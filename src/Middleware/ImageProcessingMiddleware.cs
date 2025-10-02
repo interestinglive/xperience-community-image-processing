@@ -25,6 +25,14 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         "image/webp"
     ];
 
+    // High-quality sampling (Mitchell-Netravali cubic). Great for downscaling without ringing.
+    private static readonly SKSamplingOptions HQSampling = new(new SKCubicResampler(1f / 3f, 1f / 3f));
+    private static readonly SKPaint HQPaint = new()
+    {
+        IsAntialias = true,
+        IsDither = true
+    };
+
     public async Task InvokeAsync(HttpContext context)
     {
         var originalResponseBodyStream = context.Response.Body;
@@ -85,8 +93,8 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
                 responseBodyStream.Seek(0, SeekOrigin.Begin);
                 var originalImageBytes = responseBodyStream.ToArray();
 
-                // Generate ETag
-                var eTag = GenerateETag(originalImageBytes, width ?? 0, height ?? 0, maxSideSize ?? 0, format);
+                // Generate ETag (now includes resize mode)
+                var eTag = GenerateETag(originalImageBytes, width ?? 0, height ?? 0, maxSideSize ?? 0, format, mode);
 
                 // Check if the ETag matches the client's If-None-Match header
                 if (context.Request.Headers.IfNoneMatch == eTag)
@@ -158,13 +166,25 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             }
             else
             {
-                resizedBitmap = originalBitmap.Resize(new SKImageInfo(newDims[0], newDims[1]), SKFilterQuality.High);
+                resizedBitmap = ResizeBitmap(originalBitmap, newDims[0], newDims[1]);
             }
 
             if (resizedBitmap == null)
             {
                 // _eventLogService.LogWarning(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), "Failed to resize image.");
                 return imageBytes;
+            }
+
+            // Optional gentle sharpen only when downscaling to improve perceived detail.
+            bool isDownscaled = resizedBitmap.Width < originalBitmap.Width || resizedBitmap.Height < originalBitmap.Height;
+            if (isDownscaled && _options.SharpenDownscaledImages && _options.SharpenAmount > 0f)
+            {
+                var sharpened = ApplySharpen(resizedBitmap, _options.SharpenAmount);
+                if (!ReferenceEquals(sharpened, resizedBitmap))
+                {
+                    resizedBitmap.Dispose();
+                    resizedBitmap = sharpened;
+                }
             }
 
             using var outputStream = new MemoryStream();
@@ -192,6 +212,40 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             return imageBytes;
         }
     }
+
+    // High-quality single-pass resize using cubic resampling + dithering.
+    private static SKBitmap ResizeBitmap(SKBitmap source, int targetWidth, int targetHeight)
+    {
+        if (targetWidth <= 0 || targetHeight <= 0)
+        {
+            return source;
+        }
+
+        var info = new SKImageInfo(targetWidth, targetHeight, source.ColorType, source.AlphaType, source.ColorSpace);
+        var dst = new SKBitmap(info);
+        using var canvas = new SKCanvas(dst);
+        canvas.Clear(SKColors.Transparent);
+        using var image = SKImage.FromBitmap(source);
+        var srcRect = new SKRect(0, 0, source.Width, source.Height);
+        var destRect = new SKRect(0, 0, targetWidth, targetHeight);
+        canvas.DrawImage(image, srcRect, destRect, HQSampling, HQPaint);
+        canvas.Flush();
+        return dst;
+    }
+
+    private static SKBitmap CropBitmap(SKBitmap source, SKRectI crop)
+    {
+        var dst = new SKBitmap(new SKImageInfo(crop.Width, crop.Height, source.ColorType, source.AlphaType, source.ColorSpace));
+        using var canvas = new SKCanvas(dst);
+        using var image = SKImage.FromBitmap(source);
+        var srcRect = new SKRect(crop.Left, crop.Top, crop.Right, crop.Bottom);
+        var destRect = new SKRect(0, 0, crop.Width, crop.Height);
+        // 1:1 crop, no resampling needed, but keep dither on
+        canvas.DrawImage(image, srcRect, destRect, HQSampling, HQPaint);
+        canvas.Flush();
+        return dst;
+    }
+
     private SKBitmap ResizeWithCover(SKBitmap original, int targetWidth, int targetHeight)
     {
         // Calculate missing dimension if needed.
@@ -205,78 +259,43 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         }
         else if (targetWidth <= 0 && targetHeight <= 0)
         {
-            // No dimensions provided; return original image.
             return original;
         }
 
         float originalRatio = (float)original.Width / original.Height;
         float targetRatio = (float)targetWidth / targetHeight;
-        int cropWidth, cropHeight;
 
-        // When the original is smaller than requested, avoid upscaling.
-        if (original.Width < targetWidth || original.Height < targetHeight)
+        int cropWidth, cropHeight;
+        if (originalRatio > targetRatio)
         {
-            if (originalRatio > targetRatio)
-            {
-                // Wider relative to target: use full height.
-                cropHeight = original.Height;
-                cropWidth = (int)(cropHeight * targetRatio);
-            }
-            else
-            {
-                // Taller relative to target: use full width.
-                cropWidth = original.Width;
-                cropHeight = (int)(cropWidth / targetRatio);
-            }
-            cropWidth = Math.Min(cropWidth, original.Width);
-            cropHeight = Math.Min(cropHeight, original.Height);
+            cropHeight = original.Height;
+            cropWidth = (int)(cropHeight * targetRatio);
         }
         else
         {
-            // For larger images, perform a cover crop.
-            if (originalRatio > targetRatio)
-            {
-                cropWidth = (int)(original.Height * targetRatio);
-                cropHeight = original.Height;
-            }
-            else
-            {
-                cropHeight = (int)(original.Width / targetRatio);
-                cropWidth = original.Width;
-            }
+            cropWidth = original.Width;
+            cropHeight = (int)(cropWidth / targetRatio);
         }
 
-        // Center cropping.
         int cropX = (original.Width - cropWidth) / 2;
         int cropY = (original.Height - cropHeight) / 2;
-        SKBitmap croppedBitmap = new SKBitmap(cropWidth, cropHeight);
-        using (var canvas = new SKCanvas(croppedBitmap))
-        using (var paint = new SKPaint { IsAntialias = true })
-        {
-            canvas.DrawBitmap(
-                original,
-                new SKRect(cropX, cropY, cropX + cropWidth, cropY + cropHeight),
-                new SKRect(0, 0, cropWidth, cropHeight),
-                paint);
-        }
 
-        // If original is smaller than target, return cropped image without upscaling.
+        // Avoid upscaling: if requested size exceeds original, return a centered crop only.
         if (targetWidth > original.Width || targetHeight > original.Height)
         {
-            return croppedBitmap;
+            return CropBitmap(original, new SKRectI(cropX, cropY, cropX + cropWidth, cropY + cropHeight));
         }
 
-        // Use SKSamplingOptions.High instead of SKFilterQuality.High
-        SKBitmap resizedBitmap = croppedBitmap.Resize(new SKImageInfo(targetWidth, targetHeight), new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None));
-        if (resizedBitmap != null)
-        {
-            croppedBitmap.Dispose();
-            return resizedBitmap;
-        }
-        else
-        {
-            return croppedBitmap;
-        }
+        // One-pass crop+scale to target size
+        var info = new SKImageInfo(targetWidth, targetHeight, original.ColorType, original.AlphaType, original.ColorSpace);
+        var dst = new SKBitmap(info);
+        using var canvas = new SKCanvas(dst);
+        using var image = SKImage.FromBitmap(original);
+        var srcRect = new SKRect(cropX, cropY, cropX + cropWidth, cropY + cropHeight);
+        var destRect = new SKRect(0, 0, targetWidth, targetHeight);
+        canvas.DrawImage(image, srcRect, destRect, HQSampling, HQPaint);
+        canvas.Flush();
+        return dst;
     }
 
     private SKBitmap ResizeWithCrop(SKBitmap original, int targetWidth, int targetHeight)
@@ -292,35 +311,38 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         }
         else if (targetWidth <= 0 && targetHeight <= 0)
         {
-            // No dimensions provided; return original image.
             return original;
         }
 
-        // Scale so that the image covers the target area.
-        float scale = Math.Max((float)targetWidth / original.Width, (float)targetHeight / original.Height);
-        int newWidth = (int)(original.Width * scale);
-        int newHeight = (int)(original.Height * scale);
+        // Compute centered source rect that matches target aspect ratio (cover logic),
+        // then do a single high-quality resample to the exact target size.
+        float targetRatio = (float)targetWidth / targetHeight;
+        float srcRatio = (float)original.Width / original.Height;
 
-        // Use SKSamplingOptions.High instead of SKFilterQuality.High
-        using var resized = original.Resize(new SKImageInfo(newWidth, newHeight), new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None));
-        if (resized == null)
+        int cropWidth, cropHeight;
+        if (srcRatio > targetRatio)
         {
-            return original; // Fallback if resizing fails.
+            cropHeight = original.Height;
+            cropWidth = (int)(cropHeight * targetRatio);
+        }
+        else
+        {
+            cropWidth = original.Width;
+            cropHeight = (int)(cropWidth / targetRatio);
         }
 
-        int cropX = (newWidth - targetWidth) / 2;
-        int cropY = (newHeight - targetHeight) / 2;
+        int cropX = (original.Width - cropWidth) / 2;
+        int cropY = (original.Height - cropHeight) / 2;
 
-        var croppedImage = new SKBitmap(targetWidth, targetHeight);
-        using (var canvas = new SKCanvas(croppedImage))
-        using (var paint = new SKPaint { IsAntialias = true })
-        {
-            var sourceRect = new SKRect(cropX, cropY, cropX + targetWidth, cropY + targetHeight);
-            var destRect = new SKRect(0, 0, targetWidth, targetHeight);
-            canvas.DrawBitmap(resized, sourceRect, destRect, paint);
-        }
-
-        return croppedImage;
+        var info = new SKImageInfo(targetWidth, targetHeight, original.ColorType, original.AlphaType, original.ColorSpace);
+        var dst = new SKBitmap(info);
+        using var canvas = new SKCanvas(dst);
+        using var image = SKImage.FromBitmap(original);
+        var srcRect = new SKRect(cropX, cropY, cropX + cropWidth, cropY + cropHeight);
+        var destRect = new SKRect(0, 0, targetWidth, targetHeight);
+        canvas.DrawImage(image, srcRect, destRect, HQSampling, HQPaint);
+        canvas.Flush();
+        return dst;
     }
 
     private SKBitmap ResizeWithContains(SKBitmap original, int targetWidth, int targetHeight)
@@ -336,7 +358,6 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         }
         else if (targetWidth <= 0 && targetHeight <= 0)
         {
-            // No dimensions provided; return original image.
             return original;
         }
 
@@ -349,12 +370,18 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             return original;
         }
 
-        int newWidth = (int)(original.Width * scale);
-        int newHeight = (int)(original.Height * scale);
+        int newWidth = (int)Math.Floor(original.Width * scale);
+        int newHeight = (int)Math.Floor(original.Height * scale);
 
-        // Use SKSamplingOptions.High instead of SKFilterQuality.High
-        SKBitmap resizedBitmap = original.Resize(new SKImageInfo(newWidth, newHeight), new SKSamplingOptions(SKFilterMode.Nearest, SKMipmapMode.None));
-        return resizedBitmap ?? original;
+        var info = new SKImageInfo(newWidth, newHeight, original.ColorType, original.AlphaType, original.ColorSpace);
+        var dst = new SKBitmap(info);
+        using var canvas = new SKCanvas(dst);
+        using var image = SKImage.FromBitmap(original);
+        var srcRect = new SKRect(0, 0, original.Width, original.Height);
+        var destRect = new SKRect(0, 0, newWidth, newHeight);
+        canvas.DrawImage(image, srcRect, destRect, HQSampling, HQPaint);
+        canvas.Flush();
+        return dst;
     }
 
     private string GetContentTypeFromPath(PathString path)
@@ -407,17 +434,45 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         _ => "webp",
     };
 
-    private static string GenerateETag(byte[] imageBytes, int width, int height, int maxSideSize, string format)
+    private static string GenerateETag(byte[] imageBytes, int width, int height, int maxSideSize, string format, string? mode)
     {
         var inputBytes = imageBytes
             .Concat(BitConverter.GetBytes(width))
             .Concat(BitConverter.GetBytes(height))
             .Concat(BitConverter.GetBytes(maxSideSize))
             .Concat(Encoding.UTF8.GetBytes(format))
+            .Concat(Encoding.UTF8.GetBytes(mode ?? string.Empty))
             .ToArray();
 
         var hash = MD5.HashData(inputBytes);
         return Convert.ToBase64String(hash);
+    }
+
+    private static SKBitmap ApplySharpen(SKBitmap source, float amount)
+    {
+        // Simple unsharp-like 3x3 kernel:
+        // [ 0, -a,  0 ]
+        // [ -a, 1+4a, -a ]
+        // [ 0, -a,  0 ]
+        var a = Math.Clamp(amount, 0f, 1f);
+        var center = 1f + 4f * a;
+        var kernel = new float[]
+        {
+            0f, -a, 0f,
+            -a, center, -a,
+            0f, -a, 0f
+        };
+
+        var info = new SKImageInfo(source.Width, source.Height, source.ColorType, source.AlphaType, source.ColorSpace);
+        var dst = new SKBitmap(info);
+        using var canvas = new SKCanvas(dst);
+        using var image = SKImage.FromBitmap(source);
+        using var filter = SKImageFilter.CreateMatrixConvolution(new SKSizeI(3, 3), kernel, 1f, 0f, new SKPointI(1, 1), SKShaderTileMode.Clamp, true);
+        using var paint = new SKPaint { ImageFilter = filter };
+        canvas.Clear(SKColors.Transparent);
+        canvas.DrawImage(image, 0, 0, paint);
+        canvas.Flush();
+        return dst;
     }
 
     private static async Task CopyStreamAndRestore(MemoryStream responseBodyStream, Stream originalResponseBodyStream, HttpContext context)
@@ -435,6 +490,12 @@ public class ImageProcessingOptions
 
     // Encoder quality for lossy formats (JPEG/WEBP). Higher values reduce artifacts.
     public int EncoderQuality { get; set; } = 90;
+
+    // Post-resize sharpening for downscaled images.
+    public bool SharpenDownscaledImages { get; set; } = true;
+
+    // 0..1 typical. 0.1–0.2 is subtle; higher may introduce halos.
+    public float SharpenAmount { get; set; } = 0.15f;
 }
 
 public static class ImageProcessingMiddlewareExtensions
@@ -449,3 +510,4 @@ public static class ImageProcessingMiddlewareExtensions
         return builder.UseMiddleware<ImageProcessingMiddleware>();
     }
 }
+
