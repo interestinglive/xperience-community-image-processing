@@ -33,6 +33,11 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         IsDither = true
     };
 
+    // Simplified policy constants
+    private const int RetinaThreshold = 500; // px
+    private const double RetinaScale = 2.0; // 2x for retina
+    private const int FixedQuality = 96; // Fixed encoder quality for lossy formats
+
     public async Task InvokeAsync(HttpContext context)
     {
         var originalResponseBodyStream = context.Response.Body;
@@ -55,7 +60,7 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             int? height = null;
             int? maxSideSize = null;
             string? mode = null;
-            var format = contentType;
+            string? explicitFormat = null;
 
             if (context.Request.Query.ContainsKey("width") && int.TryParse(context.Request.Query["width"], out int parsedWidth))
             {
@@ -76,16 +81,11 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
                 maxSideSize = parsedMaxSideSize;
             }
 
+            bool explicitFormatRequested = false;
             if (context.Request.Query.ContainsKey("format"))
             {
-                string? formatParsed = context.Request.Query["format"];
-
-                if (!string.IsNullOrEmpty(formatParsed))
-                {
-                    if (!formatParsed.StartsWith("image/")) formatParsed = $"image/{formatParsed}";
-                    if (formatParsed == "image/jpg") formatParsed = "image/jpeg";
-                    if (IsSupportedContentType(formatParsed)) format = formatParsed;
-                }
+                explicitFormatRequested = true;
+                explicitFormat = context.Request.Query["format"];
             }
 
             if (width.HasValue || height.HasValue || maxSideSize.HasValue)
@@ -93,10 +93,29 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
                 responseBodyStream.Seek(0, SeekOrigin.Begin);
                 var originalImageBytes = responseBodyStream.ToArray();
 
-                // Generate ETag (now includes resize mode)
-                var eTag = GenerateETag(originalImageBytes, width ?? 0, height ?? 0, maxSideSize ?? 0, format, mode);
+                var result = await ProcessImageAsync(
+                    originalImageBytes,
+                    width ?? 0,
+                    height ?? 0,
+                    maxSideSize ?? 0,
+                    explicitFormat,
+                    contentType,
+                    context.Request.Path,
+                    mode,
+                    explicitFormatRequested
+                );
 
-                // Check if the ETag matches the client's If-None-Match header
+                // Generate ETag: include final target dims, format, mode, quality, and retina flag
+                var eTag = GenerateETag(
+                    originalImageBytes,
+                    result.TargetWidth,
+                    result.TargetHeight,
+                    result.Format,
+                    mode,
+                    FixedQuality,
+                    result.RetinaApplied
+                );
+
                 if (context.Request.Headers.IfNoneMatch == eTag)
                 {
                     context.Response.StatusCode = StatusCodes.Status304NotModified;
@@ -105,20 +124,18 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
                     return;
                 }
 
-                var processedImageBytes = await ProcessImageAsync(originalImageBytes, width ?? 0, height ?? 0, maxSideSize ?? 0, format, contentType, context.Request.Path, mode);
-
-                var filename = $"{Path.GetFileNameWithoutExtension(context.Request.Path)}.{GetFileExtensionByContentType(format)}";
+                var filename = $"{Path.GetFileNameWithoutExtension(context.Request.Path)}.{GetFileExtensionByContentType(result.Format)}";
 
                 context.Response.Body = originalResponseBodyStream;
-                context.Response.ContentType = format;
+                context.Response.ContentType = result.Format;
                 context.Response.Headers.ETag = eTag;
                 context.Response.Headers.CacheControl = "public, max-age=31536000";
-                context.Response.Headers.ContentLength = processedImageBytes.Length;
+                context.Response.Headers.ContentLength = result.Bytes.Length;
                 context.Response.Headers.ContentDisposition = $"inline; filename={filename}";
 
                 if (context.Response.StatusCode != StatusCodes.Status304NotModified)
                 {
-                    await context.Response.Body.WriteAsync(processedImageBytes);
+                    await context.Response.Body.WriteAsync(result.Bytes);
                 }
                 return;
             }
@@ -127,16 +144,28 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         await CopyStreamAndRestore(responseBodyStream, originalResponseBodyStream, context);
     }
 
-    private async Task<byte[]> ProcessImageAsync(byte[] imageBytes, int width, int height, int maxSideSize, string format, string contentType, string path, string? resizeMode)
+    private readonly record struct ProcessedImageResult(byte[] Bytes, string Format, int TargetWidth, int TargetHeight, bool RetinaApplied);
+
+    private async Task<ProcessedImageResult> ProcessImageAsync(
+        byte[] imageBytes,
+        int width,
+        int height,
+        int maxSideSize,
+        string? requestedFormat,
+        string originalContentType,
+        string path,
+        string? resizeMode,
+        bool explicitFormatRequested)
     {
-        if (imageBytes.Length == 0 || (!IsSupportedContentType(contentType) && !IsPathToBeProcessed(path, _options)))
+        if (imageBytes.Length == 0 || (!IsSupportedContentType(originalContentType) && !IsPathToBeProcessed(path, _options)))
         {
-            return imageBytes;
+            return new ProcessedImageResult(imageBytes, requestedFormat ?? "image/webp", 0, 0, false);
         }
 
-        if (width <= 0 && height <= 0 && maxSideSize <= 0 && format == contentType)
+        if (width <= 0 && height <= 0 && maxSideSize <= 0 && !explicitFormatRequested)
         {
-            return imageBytes;
+            // No resize and no format change requested -> default to WebP output without change
+            return new ProcessedImageResult(imageBytes, "image/webp", 0, 0, false);
         }
 
         try
@@ -145,71 +174,69 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             using var originalBitmap = SKBitmap.Decode(inputStream);
             if (originalBitmap == null)
             {
-                //_eventLogService.LogWarning(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), "Failed to decode image.");
-                return imageBytes;
+                return new ProcessedImageResult(imageBytes, requestedFormat ?? "image/webp", 0, 0, false);
             }
 
-            SKBitmap? resizedBitmap = null;
-            var newDims = ImageHelper.EnsureImageDimensions(width, height, maxSideSize, originalBitmap.Width, originalBitmap.Height);
+            // Compute target dims
+            var dims = ImageHelper.EnsureImageDimensions(width, height, maxSideSize, originalBitmap.Width, originalBitmap.Height);
+            int targetW = dims[0];
+            int targetH = dims[1];
 
-            if (resizeMode == "cover")
+            // Apply Retina upscaling if target is small (cap to original to avoid excessive blur)
+            bool retinaApplied = false;
+            int maxTargetSide = Math.Max(targetW, targetH);
+            if (maxTargetSide > 0 && maxTargetSide < RetinaThreshold)
             {
-                resizedBitmap = ResizeWithCover(originalBitmap, width, height);
+                targetW = (int)Math.Round(targetW * RetinaScale);
+                targetH = (int)Math.Round(targetH * RetinaScale);
+                targetW = Math.Clamp(targetW, 1, originalBitmap.Width);
+                targetH = Math.Clamp(targetH, 1, originalBitmap.Height);
+                retinaApplied = true;
             }
-            else if (resizeMode == "crop")
+
+            // Fallback to original if no valid size computed
+            if (targetW <= 0 || targetH <= 0)
             {
-                resizedBitmap = ResizeWithCrop(originalBitmap, width, height);
+                targetW = originalBitmap.Width;
+                targetH = originalBitmap.Height;
             }
-            else if (resizeMode == "contain")
+
+            // Choose format: explicit request wins, otherwise always WebP
+            string finalFormat = ResolveFormat(requestedFormat, explicitFormatRequested);
+
+            // Perform resize based on mode
+            SKBitmap? resizedBitmap = resizeMode switch
             {
-                resizedBitmap = ResizeWithContains(originalBitmap, width, height);
-            }
-            else
-            {
-                resizedBitmap = ResizeBitmap(originalBitmap, newDims[0], newDims[1]);
-            }
+                "cover" => ResizeWithCover(originalBitmap, targetW, targetH),
+                "crop" => ResizeWithCrop(originalBitmap, targetW, targetH),
+                "contain" => ResizeWithContains(originalBitmap, targetW, targetH),
+                _ => ResizeBitmap(originalBitmap, targetW, targetH)
+            };
 
             if (resizedBitmap == null)
             {
-                // _eventLogService.LogWarning(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), "Failed to resize image.");
-                return imageBytes;
-            }
-
-            // Optional gentle sharpen only when downscaling to improve perceived detail.
-            bool isDownscaled = resizedBitmap.Width < originalBitmap.Width || resizedBitmap.Height < originalBitmap.Height;
-            if (isDownscaled && _options.SharpenDownscaledImages && _options.SharpenAmount > 0f)
-            {
-                var sharpened = ApplySharpen(resizedBitmap, _options.SharpenAmount);
-                if (!ReferenceEquals(sharpened, resizedBitmap))
-                {
-                    resizedBitmap.Dispose();
-                    resizedBitmap = sharpened;
-                }
+                return new ProcessedImageResult(imageBytes, finalFormat, targetW, targetH, retinaApplied);
             }
 
             using var outputStream = new MemoryStream();
-            var imageFormat = GetImageFormat(format);
+            var imageFormat = GetImageFormat(finalFormat);
 
-            // Choose a higher encoder quality for lossy formats to reduce pixelation.
-            var quality = imageFormat switch
-            {
-                SKEncodedImageFormat.Jpeg => _options.EncoderQuality,
-                SKEncodedImageFormat.Webp => _options.EncoderQuality,
-                SKEncodedImageFormat.Png => 100, // quality parameter is not used the same way for PNG
-                _ => _options.EncoderQuality
-            };
+            // Encode with fixed quality; PNG quality parameter is ignored by encoder but harmless to pass 100
+            int quality = imageFormat == SKEncodedImageFormat.Png ? 100 : FixedQuality;
 
-            using (var encoded = resizedBitmap.Encode(imageFormat, quality))
+            using (var image = SKImage.FromBitmap(resizedBitmap))
             {
-                encoded.SaveTo(outputStream);
+                // Prefer the generic encode path for simplicity
+                using var data = image.Encode(imageFormat, quality);
+                data.SaveTo(outputStream);
             }
 
-            return outputStream.ToArray();
+            return new ProcessedImageResult(outputStream.ToArray(), finalFormat, targetW, targetH, retinaApplied);
         }
         catch (Exception ex)
         {
             _eventLogService.LogException(nameof(ImageProcessingMiddleware), nameof(ProcessImageAsync), ex);
-            return imageBytes;
+            return new ProcessedImageResult(imageBytes, requestedFormat ?? "image/webp", 0, 0, false);
         }
     }
 
@@ -233,89 +260,9 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         return dst;
     }
 
-    private static SKBitmap CropBitmap(SKBitmap source, SKRectI crop)
+    private static SKBitmap ResizeWithCover(SKBitmap original, int targetWidth, int targetHeight)
     {
-        var dst = new SKBitmap(new SKImageInfo(crop.Width, crop.Height, source.ColorType, source.AlphaType, source.ColorSpace));
-        using var canvas = new SKCanvas(dst);
-        using var image = SKImage.FromBitmap(source);
-        var srcRect = new SKRect(crop.Left, crop.Top, crop.Right, crop.Bottom);
-        var destRect = new SKRect(0, 0, crop.Width, crop.Height);
-        // 1:1 crop, no resampling needed, but keep dither on
-        canvas.DrawImage(image, srcRect, destRect, HQSampling, HQPaint);
-        canvas.Flush();
-        return dst;
-    }
-
-    private SKBitmap ResizeWithCover(SKBitmap original, int targetWidth, int targetHeight)
-    {
-        // Calculate missing dimension if needed.
-        if (targetWidth <= 0 && targetHeight > 0)
-        {
-            targetWidth = (int)Math.Round((double)original.Width * targetHeight / original.Height);
-        }
-        else if (targetHeight <= 0 && targetWidth > 0)
-        {
-            targetHeight = (int)Math.Round((double)original.Height * targetWidth / original.Width);
-        }
-        else if (targetWidth <= 0 && targetHeight <= 0)
-        {
-            return original;
-        }
-
-        float originalRatio = (float)original.Width / original.Height;
-        float targetRatio = (float)targetWidth / targetHeight;
-
-        int cropWidth, cropHeight;
-        if (originalRatio > targetRatio)
-        {
-            cropHeight = original.Height;
-            cropWidth = (int)(cropHeight * targetRatio);
-        }
-        else
-        {
-            cropWidth = original.Width;
-            cropHeight = (int)(cropWidth / targetRatio);
-        }
-
-        int cropX = (original.Width - cropWidth) / 2;
-        int cropY = (original.Height - cropHeight) / 2;
-
-        // Avoid upscaling: if requested size exceeds original, return a centered crop only.
-        if (targetWidth > original.Width || targetHeight > original.Height)
-        {
-            return CropBitmap(original, new SKRectI(cropX, cropY, cropX + cropWidth, cropY + cropHeight));
-        }
-
-        // One-pass crop+scale to target size
-        var info = new SKImageInfo(targetWidth, targetHeight, original.ColorType, original.AlphaType, original.ColorSpace);
-        var dst = new SKBitmap(info);
-        using var canvas = new SKCanvas(dst);
-        using var image = SKImage.FromBitmap(original);
-        var srcRect = new SKRect(cropX, cropY, cropX + cropWidth, cropY + cropHeight);
-        var destRect = new SKRect(0, 0, targetWidth, targetHeight);
-        canvas.DrawImage(image, srcRect, destRect, HQSampling, HQPaint);
-        canvas.Flush();
-        return dst;
-    }
-
-    private SKBitmap ResizeWithCrop(SKBitmap original, int targetWidth, int targetHeight)
-    {
-        // Calculate missing dimension if needed.
-        if (targetWidth <= 0 && targetHeight > 0)
-        {
-            targetWidth = (int)Math.Round((double)original.Width * targetHeight / original.Height);
-        }
-        else if (targetHeight <= 0 && targetWidth > 0)
-        {
-            targetHeight = (int)Math.Round((double)original.Height * targetWidth / original.Width);
-        }
-        else if (targetWidth <= 0 && targetHeight <= 0)
-        {
-            return original;
-        }
-
-        // Compute centered source rect that matches target aspect ratio (cover logic),
-        // then do a single high-quality resample to the exact target size.
+        // Compute centered crop to match aspect ratio, then scale to target (allow upscaling)
         float targetRatio = (float)targetWidth / targetHeight;
         float srcRatio = (float)original.Width / original.Height;
 
@@ -331,8 +278,8 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
             cropHeight = (int)(cropWidth / targetRatio);
         }
 
-        int cropX = (original.Width - cropWidth) / 2;
-        int cropY = (original.Height - cropHeight) / 2;
+        int cropX = Math.Max(0, (original.Width - cropWidth) / 2);
+        int cropY = Math.Max(0, (original.Height - cropHeight) / 2);
 
         var info = new SKImageInfo(targetWidth, targetHeight, original.ColorType, original.AlphaType, original.ColorSpace);
         var dst = new SKBitmap(info);
@@ -345,43 +292,31 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         return dst;
     }
 
-    private SKBitmap ResizeWithContains(SKBitmap original, int targetWidth, int targetHeight)
+    private static SKBitmap ResizeWithCrop(SKBitmap original, int targetWidth, int targetHeight)
     {
-        // Calculate missing dimension if needed.
-        if (targetWidth <= 0 && targetHeight > 0)
-        {
-            targetWidth = (int)Math.Round((double)original.Width * targetHeight / original.Height);
-        }
-        else if (targetHeight <= 0 && targetWidth > 0)
-        {
-            targetHeight = (int)Math.Round((double)original.Height * targetWidth / original.Width);
-        }
-        else if (targetWidth <= 0 && targetHeight <= 0)
-        {
-            return original;
-        }
+        // Same as cover logic to fill target exactly
+        return ResizeWithCover(original, targetWidth, targetHeight);
+    }
 
-        // Calculate scale to fit within target dimensions while preserving the aspect ratio.
+    private static SKBitmap ResizeWithContains(SKBitmap original, int targetWidth, int targetHeight)
+    {
+        // Fit within target box while preserving aspect ratio (allow upscaling for retina targets)
         float scale = Math.Min((float)targetWidth / original.Width, (float)targetHeight / original.Height);
+        int newWidth = Math.Max(1, (int)Math.Round(original.Width * scale));
+        int newHeight = Math.Max(1, (int)Math.Round(original.Height * scale));
+        return ResizeBitmap(original, newWidth, newHeight);
+    }
 
-        // Do not upscale in contain mode.
-        if (scale >= 1f)
+    private static string ResolveFormat(string? requestedFormat, bool explicitRequested)
+    {
+        if (explicitRequested && !string.IsNullOrEmpty(requestedFormat))
         {
-            return original;
+            var fmt = requestedFormat;
+            if (!fmt.StartsWith("image/")) fmt = $"image/{fmt}";
+            if (fmt == "image/jpg") fmt = "image/jpeg";
+            return fmt;
         }
-
-        int newWidth = (int)Math.Floor(original.Width * scale);
-        int newHeight = (int)Math.Floor(original.Height * scale);
-
-        var info = new SKImageInfo(newWidth, newHeight, original.ColorType, original.AlphaType, original.ColorSpace);
-        var dst = new SKBitmap(info);
-        using var canvas = new SKCanvas(dst);
-        using var image = SKImage.FromBitmap(original);
-        var srcRect = new SKRect(0, 0, original.Width, original.Height);
-        var destRect = new SKRect(0, 0, newWidth, newHeight);
-        canvas.DrawImage(image, srcRect, destRect, HQSampling, HQPaint);
-        canvas.Flush();
-        return dst;
+        return "image/webp"; // default
     }
 
     private string GetContentTypeFromPath(PathString path)
@@ -434,45 +369,19 @@ public class ImageProcessingMiddleware(RequestDelegate next, IEventLogService ev
         _ => "webp",
     };
 
-    private static string GenerateETag(byte[] imageBytes, int width, int height, int maxSideSize, string format, string? mode)
+    private static string GenerateETag(byte[] imageBytes, int targetWidth, int targetHeight, string format, string? mode, int quality, bool retinaApplied)
     {
         var inputBytes = imageBytes
-            .Concat(BitConverter.GetBytes(width))
-            .Concat(BitConverter.GetBytes(height))
-            .Concat(BitConverter.GetBytes(maxSideSize))
+            .Concat(BitConverter.GetBytes(targetWidth))
+            .Concat(BitConverter.GetBytes(targetHeight))
             .Concat(Encoding.UTF8.GetBytes(format))
             .Concat(Encoding.UTF8.GetBytes(mode ?? string.Empty))
+            .Concat(BitConverter.GetBytes(quality))
+            .Concat(BitConverter.GetBytes(retinaApplied))
             .ToArray();
 
         var hash = MD5.HashData(inputBytes);
         return Convert.ToBase64String(hash);
-    }
-
-    private static SKBitmap ApplySharpen(SKBitmap source, float amount)
-    {
-        // Simple unsharp-like 3x3 kernel:
-        // [ 0, -a,  0 ]
-        // [ -a, 1+4a, -a ]
-        // [ 0, -a,  0 ]
-        var a = Math.Clamp(amount, 0f, 1f);
-        var center = 1f + 4f * a;
-        var kernel = new float[]
-        {
-            0f, -a, 0f,
-            -a, center, -a,
-            0f, -a, 0f
-        };
-
-        var info = new SKImageInfo(source.Width, source.Height, source.ColorType, source.AlphaType, source.ColorSpace);
-        var dst = new SKBitmap(info);
-        using var canvas = new SKCanvas(dst);
-        using var image = SKImage.FromBitmap(source);
-        using var filter = SKImageFilter.CreateMatrixConvolution(new SKSizeI(3, 3), kernel, 1f, 0f, new SKPointI(1, 1), SKShaderTileMode.Clamp, true);
-        using var paint = new SKPaint { ImageFilter = filter };
-        canvas.Clear(SKColors.Transparent);
-        canvas.DrawImage(image, 0, 0, paint);
-        canvas.Flush();
-        return dst;
     }
 
     private static async Task CopyStreamAndRestore(MemoryStream responseBodyStream, Stream originalResponseBodyStream, HttpContext context)
@@ -487,15 +396,6 @@ public class ImageProcessingOptions
 {
     public bool? ProcessMediaLibrary { get; set; } = true;
     public bool? ProcessContentItemAssets { get; set; } = true;
-
-    // Encoder quality for lossy formats (JPEG/WEBP). Higher values reduce artifacts.
-    public int EncoderQuality { get; set; } = 90;
-
-    // Post-resize sharpening for downscaled images.
-    public bool SharpenDownscaledImages { get; set; } = true;
-
-    // 0..1 typical. 0.1–0.2 is subtle; higher may introduce halos.
-    public float SharpenAmount { get; set; } = 0.15f;
 }
 
 public static class ImageProcessingMiddlewareExtensions
